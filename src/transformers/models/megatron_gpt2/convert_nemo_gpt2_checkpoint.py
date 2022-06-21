@@ -72,18 +72,21 @@ def fix_query_key_value_ordering(param, checkpoint_version, num_splits, num_head
     # https://github.com/NVIDIA/Megatron-LM/blob/v2.4/megatron/checkpointing.py#L209
     # If param is the weight tensor of the self-attention block, the returned tensor
     # will have to be transposed one more time to be read by HuggingFace GPT2.
+
     input_shape = param.size()
-    if checkpoint_version == 1.0:
-        # version 1.0 stores [num_heads * hidden_size * num_splits, :]
-        saved_shape = (num_heads, hidden_size, num_splits) + input_shape[1:]
-        param = param.view(*saved_shape)
-        param = param.transpose(0, 2)
-        param = param.transpose(1, 2).contiguous()
-    elif checkpoint_version >= 2.0:
-        # other versions store [num_heads * num_splits * hidden_size, :]
-        saved_shape = (num_heads, num_splits, hidden_size) + input_shape[1:]
-        param = param.view(*saved_shape)
-        param = param.transpose(0, 1).contiguous()
+    # if checkpoint_version == 1.0:
+    #     # version 1.0 stores [num_heads * hidden_size * num_splits, :]
+    #     saved_shape = (num_heads, hidden_size, num_splits) + input_shape[1:]
+    #     param = param.view(*saved_shape)
+    #     param = param.transpose(0, 2)
+    #     param = param.transpose(1, 2).contiguous()
+    # elif checkpoint_version >= 0.0:
+    
+    # other versions store [num_heads * num_splits * hidden_size, :]
+    # NeMo has no ckeckpoint version
+    saved_shape = (num_heads, num_splits, hidden_size) + input_shape[1:]
+    param = param.view(*saved_shape)
+    param = param.transpose(0, 1).contiguous()
     param = param.view(*input_shape)
     return param
 
@@ -95,21 +98,7 @@ def convert_megatron_checkpoint(args, input_state_dict, config):
     # The converted output model.
     output_state_dict = {}
     from pprint import pprint
-    # old versions did not store training args
-    ds_args = input_state_dict.get("args", None)
     
-    if ds_args is not None:
-        # do not make the user write a config file when the exact dimensions/sizes are already in the checkpoint
-        # from pprint import pprint
-        pprint(vars(ds_args))
-
-        config.vocab_size = ds_args.padded_vocab_size
-        config.n_positions = ds_args.max_position_embeddings
-        config.n_embd = ds_args.hidden_size
-        config.n_layer = ds_args.num_layers
-        config.n_head = ds_args.num_attention_heads
-        config.n_inner = ds_args.ffn_hidden_size
-        # pprint(config)
     hyper_params = input_state_dict["hyper_parameters"]
     if hyper_params is not None:    
         # config.vocab_size = ds_args.padded_vocab_size
@@ -123,18 +112,15 @@ def convert_megatron_checkpoint(args, input_state_dict, config):
     heads = config.n_head
     # The hidden_size per head.
     hidden_size_per_head = config.n_embd // config.n_head
+    
     # Nemo-Megatron checkpoint version  # Nemo has no checkpoint version
     if "checkpoint_version" in input_state_dict.keys():
         checkpoint_version = input_state_dict["checkpoint_version"]
     else:
         checkpoint_version = 0.0
-    
-    print(input_state_dict.keys())
-    for key in input_state_dict.keys():
-        print('{}: {}'.format(key, input_state_dict[key]))
+        
     state_dict = input_state_dict["state_dict"]
-    # for k in state_dict.keys():
-    #     print('key:', k)
+    
     # The word embeddings.
     word_embeddings = state_dict["model.language_model.embedding.word_embeddings.weight"]
     # Truncate the embedding table to vocab_size rows.
@@ -162,17 +148,18 @@ def convert_megatron_checkpoint(args, input_state_dict, config):
         "mlp.dense_4h_to_h": ".mlp.c_proj.",
     }
 
-    for key, val in state_dict.items():        
+    for key, val in state_dict.items():
+        print('key:', key)
         # Pass the preprocessed keys.
         if "embedding.word_embeddings" in key or "embedding.position_embeddings" in key:
             continue
-
+        
         # Match the name.
         m = layer_re.match(key)
 
         # Stop if that's not a layer
         if m is None:
-            continue
+            break
 
         # The index of the layer.
         layer_idx = int(m.group(1))
@@ -183,7 +170,7 @@ def convert_megatron_checkpoint(args, input_state_dict, config):
 
         # The name of the layer.
         layer_name = f"transformer.h.{layer_idx}"
-
+        
         # For layernorm(s), simply store the layer norm.
         if op_name.endswith("layernorm"):
             ln_name = "ln_1" if op_name.startswith("input") else "ln_2"
@@ -193,6 +180,7 @@ def convert_megatron_checkpoint(args, input_state_dict, config):
         elif (
             op_name == "attention.query_key_value" or op_name == "self_attention.query_key_value"
         ) and weight_or_bias == "weight":
+            # print('\t2:', op_name)
 
             # Insert a tensor of 1x1xDxD bias.
             causal_mask = torch.tril(torch.ones((n_positions, n_positions), dtype=torch.float16)).view(
@@ -214,22 +202,28 @@ def convert_megatron_checkpoint(args, input_state_dict, config):
         elif (
             op_name == "attention.query_key_value" or op_name == "self_attention.query_key_value"
         ) and weight_or_bias == "bias":
-
+            # print('\t3:', op_name)
+            print('\t3:', op_name, val.size())
             out_val = fix_query_key_value_ordering(val, checkpoint_version, 3, heads, hidden_size_per_head)
+            print('\t3:', op_name, out_val.size())
             # Store. No change of shape.
             output_state_dict[layer_name + ".attn.c_attn.bias"] = out_val
 
         # Transpose the weights.
         elif weight_or_bias == "weight":
+            # print('\t4:', op_name)
 
             out_name = megatron_to_transformers[op_name]
             output_state_dict[layer_name + out_name + "weight"] = val.transpose(0, 1)
 
         # Copy the bias.
         elif weight_or_bias == "bias":
+            # print('\t5:', op_name)
 
             out_name = megatron_to_transformers[op_name]
             output_state_dict[layer_name + out_name + "bias"] = val
+        else:
+            print('\t6:', op_name)
 
     # # DEBUG.
     assert config.n_layer == layer_idx + 1
